@@ -31,7 +31,7 @@ Nano-Reasoning implements an adaptive speculative decoding pipeline where a smal
 - **FastRL Integration**: Multi-Armed Bandit (MAB) for adaptive SD configuration selection
 - **Adaptive Rollout Engine**: Dynamic enable/disable of speculative decoding based on batch characteristics
 - **Hidden State Collection**: Collects target model hidden states during inference for drafter training
-- **Single-Layer EAGLE Drafter**: Lightweight FastRL-style drafter head (~1MB vs ~1GB for full model)
+- **Single-Layer EAGLE Drafter**: Lightweight FastRL-style drafter head (single layer, tens of MB vs full 0.6B FP16)
 - **Online Drafter Training**: Continuous adaptation during inference using collected hidden states
 
 ## Hardware Tiers
@@ -193,7 +193,7 @@ if orchestrator.isFastRLMode() {
 ```
 
 **FastRL Benefits:**
-- ~1000x smaller drafter (1MB vs 1GB)
+- Far smaller drafter head than the full 0.6B model (single-layer head vs ~1.2GB FP16 weights)
 - Faster adaptation during inference
 - MAB-based SD configuration selection
 - Automatic batch-size-aware SD enable/disable
