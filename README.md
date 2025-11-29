@@ -310,6 +310,7 @@ swift package generate-documentation
 ## References
 
 - [EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty](https://arxiv.org/abs/2401.15077)
+- [Taming the Long-Tail: Efficient Reasoning RL Training with Adaptive Drafter](https://arxiv.org/abs/2511.16665)
 - [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192)
 - [MLX: Efficient and flexible machine learning on Apple silicon](https://github.com/ml-explore/mlx)
 
