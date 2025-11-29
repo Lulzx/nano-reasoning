@@ -352,10 +352,14 @@ public actor TargetModel {
     private var kvCache: KVCache?
     private var isLoaded: Bool = false
     
-    // Model info
+    // Model info from config.json or tier defaults
     private var vocabSize: Int = 0
     private var hiddenSize: Int = 0
     private var numLayers: Int = 0
+    private var numHeads: Int = 0
+    private var numKVHeads: Int = 0
+    private var intermediateSize: Int = 0
+    private var ropeTheta: Float = 1000000.0
     private var weightsLoaded: Bool = false
     
     // Statistics
@@ -367,76 +371,160 @@ public actor TargetModel {
         self.hardwareTier = tier
     }
     
-
-    // Model Loading
+    /// Set model dimensions from hardware tier defaults
+    private func setDimensionsFromTier() {
+        let weightConfig = ModelWeightConfig.forQwen3(tier: hardwareTier)
+        vocabSize = weightConfig.vocabSize
+        hiddenSize = weightConfig.hiddenSize
+        numLayers = weightConfig.numLayers
+        numHeads = weightConfig.numHeads
+        numKVHeads = weightConfig.numKVHeads
+        intermediateSize = weightConfig.intermediateSize
+    }
     
-    /// Load and initialize the target model with tier-appropriate dimensions.
-    /// Creates transformer layers, embeddings, and LM head based on hardware tier.
-    /// For production use, integrate with MLX-LM model loading from HuggingFace.
-    public func loadModel(progressHandler: ((Double) -> Void)? = nil) async throws {
-        guard !isLoaded else { return }
-        
-        progressHandler?(0.0)
-        
-        // Set model dimensions based on tier
-        switch hardwareTier {
-        case .entry:
-            vocabSize = 151936
-            hiddenSize = 2048
-            numLayers = 28
-        case .pro:
-            vocabSize = 151936
-            hiddenSize = 4096
-            numLayers = 32
-        case .elite:
-            vocabSize = 151936
-            hiddenSize = 5120
-            numLayers = 64
-        }
-        
-        progressHandler?(0.2)
-        
-        // Create model components
+    /// Create model architecture based on current dimensions
+    private func createModelArchitecture() {
+        // Create embedding layer
         embedTokens = Embedding(embeddingCount: vocabSize, dimensions: hiddenSize)
         
-        progressHandler?(0.4)
-        
         // Create transformer layers
-        let numHeads = hiddenSize / 128  // Standard head dim of 128
-        let numKVHeads = numHeads / 4    // GQA with 4:1 ratio
-        let intermediateSize = Int(Float(hiddenSize) * 2.75)
-        
+        layers.removeAll()
         for _ in 0..<numLayers {
             let layer = QwenDecoderLayer(
                 hiddenSize: hiddenSize,
                 numHeads: numHeads,
                 numKVHeads: numKVHeads,
                 intermediateSize: intermediateSize,
-                ropeTheta: 1000000.0
+                ropeTheta: ropeTheta
             )
             layers.append(layer)
         }
         
-        progressHandler?(0.8)
-        
+        // Create output layers
         norm = RMSNorm(dimensions: hiddenSize)
         lmHead = Linear(hiddenSize, vocabSize, bias: false)
         
+        // Create KV cache
         kvCache = KVCache(numLayers: numLayers)
+    }
+
+
+    // Model Loading
+    
+    /// Load and initialize the target model with tier-appropriate dimensions.
+    /// Automatically downloads weights from HuggingFace if not cached locally.
+    /// Creates transformer layers, embeddings, and LM head based on model configuration.
+    public func loadModel(progressHandler: ((Double) -> Void)? = nil) async throws {
+        guard !isLoaded else { return }
         
-        // Attempt to load pretrained weights if available
-        if let weightsURL = resolveWeightsURL() {
-            do {
-                try loadPretrainedWeights(from: weightsURL)
-                weightsLoaded = true
-            } catch {
-                // Fallback to randomly initialized weights
-                print("Warning: Failed to load pretrained weights at \(weightsURL.path): \(error)")
+        progressHandler?(0.0)
+        
+        // Try to download/load model from HuggingFace Hub
+        let downloadConfig = ModelDownloadConfig(modelId: configuration.targetModelId)
+        
+        do {
+            let downloaded = try await ModelDownloader.shared.downloadModel(
+                config: downloadConfig,
+                progressHandler: nil  // Progress not forwarded due to actor isolation
+            )
+            
+            progressHandler?(0.5)
+            
+            // Load model configuration from config.json
+            if let configPath = downloaded.configPath,
+               FileManager.default.fileExists(atPath: configPath.path) {
+                let parsedConfig = try ModelConfigLoader.load(from: configPath)
+                vocabSize = parsedConfig.vocabSize
+                hiddenSize = parsedConfig.hiddenSize
+                numLayers = parsedConfig.numLayers
+                numHeads = parsedConfig.numHeads
+                numKVHeads = parsedConfig.numKVHeads
+                intermediateSize = parsedConfig.intermediateSize
+                ropeTheta = parsedConfig.ropeTheta
+            } else {
+                // Fallback to tier-based defaults
+                setDimensionsFromTier()
+            }
+            
+            progressHandler?(0.6)
+            
+            // Create model architecture
+            createModelArchitecture()
+            
+            progressHandler?(0.7)
+            
+            // Load weights from downloaded safetensors
+            try loadPretrainedWeights(from: downloaded.weightsPath)
+            weightsLoaded = true
+            
+            // Validate loaded weight shapes
+            try validateModelShapes()
+            
+            progressHandler?(0.95)
+            
+        } catch {
+            // Fallback to tier-based initialization if download fails
+            print("Warning: Could not download model (\(error)), using tier-based initialization")
+            
+            setDimensionsFromTier()
+            createModelArchitecture()
+            
+            // Try local weights if available
+            if let weightsURL = resolveWeightsURL() {
+                do {
+                    try loadPretrainedWeights(from: weightsURL)
+                    weightsLoaded = true
+                    try validateModelShapes()
+                } catch {
+                    print("Warning: Failed to load pretrained weights at \(weightsURL.path): \(error)")
+                }
             }
         }
         
         progressHandler?(1.0)
         isLoaded = true
+    }
+    
+    /// Validate that model shapes are consistent
+    private func validateModelShapes() throws {
+        guard let embedTokens = embedTokens, let lmHead = lmHead else {
+            throw TargetModelError.verificationFailed("Model components not initialized")
+        }
+        
+        // Validate embedding dimensions
+        let embedParams = embedTokens.parameters().flattened()
+        for (key, value) in embedParams {
+            if key.contains("weight") {
+                guard value.shape.count == 2,
+                      value.shape[0] == vocabSize,
+                      value.shape[1] == hiddenSize else {
+                    throw TargetModelError.verificationFailed(
+                        "Embedding shape mismatch: expected [\(vocabSize), \(hiddenSize)], got \(value.shape)"
+                    )
+                }
+            }
+        }
+        
+        // Validate LM head dimensions
+        let lmHeadParams = lmHead.parameters().flattened()
+        for (key, value) in lmHeadParams {
+            if key.contains("weight") {
+                guard value.shape.count == 2,
+                      value.shape[0] == vocabSize,
+                      value.shape[1] == hiddenSize else {
+                    throw TargetModelError.verificationFailed(
+                        "LM head shape mismatch: expected [\(vocabSize), \(hiddenSize)], got \(value.shape)"
+                    )
+                }
+            }
+        }
+        
+        // Validate layer count
+        guard layers.count == numLayers else {
+            throw TargetModelError.verificationFailed(
+                "Layer count mismatch: expected \(numLayers), got \(layers.count)"
+            )
+        }
     }
     
     /// Resolve weights path (env override or cache directory)
@@ -445,14 +533,25 @@ public actor TargetModel {
             return env
         }
         
-        // Default cache path: ~/.cache/nano-reasoning/models/<modelId>/weights.safetensors
+        // Check for weights in multiple locations
         let safeId = configuration.targetModelId.replacingOccurrences(of: "/", with: "_")
-        let defaultPath = EnvironmentConfig.modelCacheDirectory
-            .appendingPathComponent(safeId)
-            .appendingPathComponent("weights.safetensors")
-        if FileManager.default.fileExists(atPath: defaultPath.path) {
-            return defaultPath
+        let baseDir = EnvironmentConfig.modelCacheDirectory.appendingPathComponent(safeId)
+        
+        // Try different weight file names
+        let possibleNames = ["model.safetensors", "weights.safetensors", "pytorch_model.bin"]
+        for name in possibleNames {
+            let path = baseDir.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: path.path) {
+                return path
+            }
         }
+        
+        // Check for sharded weights
+        let shardPath = baseDir.appendingPathComponent("model-00001-of-00001.safetensors")
+        if FileManager.default.fileExists(atPath: shardPath.path) {
+            return shardPath
+        }
+        
         return nil
     }
     

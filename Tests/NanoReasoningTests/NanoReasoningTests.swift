@@ -355,3 +355,325 @@ final class NanoReasoningIntegrationTests: XCTestCase {
         XCTAssertFalse(profile.gpuName.isEmpty)
     }
 }
+
+// MARK: - Model Loading Tests
+
+final class ModelLoadingTests: XCTestCase {
+    
+    // MARK: - ModelDownloader Tests
+    
+    func testModelDownloadConfigCreation() {
+        let config = ModelDownloadConfig(modelId: "Qwen/Qwen3-0.6B")
+        XCTAssertEqual(config.modelId, "Qwen/Qwen3-0.6B")
+        XCTAssertEqual(config.revision, "main")
+        XCTAssertFalse(config.forceRedownload)
+    }
+    
+    func testModelDownloadConfigWithCustomCache() {
+        let customCache = URL(fileURLWithPath: "/tmp/test-cache")
+        let config = ModelDownloadConfig(
+            modelId: "Qwen/Qwen3-0.6B",
+            revision: "main",
+            cacheDirectory: customCache,
+            forceRedownload: true
+        )
+        XCTAssertEqual(config.cacheDirectory, customCache)
+        XCTAssertTrue(config.forceRedownload)
+    }
+    
+    func testDownloadProgressDescription() {
+        let progress = DownloadProgress(
+            bytesDownloaded: 500_000_000,
+            totalBytes: 1_000_000_000,
+            currentFile: "model.safetensors",
+            filesCompleted: 2,
+            totalFiles: 4
+        )
+        
+        XCTAssertEqual(progress.fractionCompleted, 0.5, accuracy: 0.01)
+        XCTAssertTrue(progress.description.contains("500.0"))
+        XCTAssertTrue(progress.description.contains("2/4"))
+    }
+    
+    func testDownloadProgressZeroTotal() {
+        let progress = DownloadProgress(
+            bytesDownloaded: 0,
+            totalBytes: 0,
+            currentFile: "starting",
+            filesCompleted: 0,
+            totalFiles: 0
+        )
+        
+        XCTAssertEqual(progress.fractionCompleted, 0.0)
+    }
+    
+    func testModelDownloadErrorDescriptions() {
+        let networkError = ModelDownloadError.networkError("Connection failed")
+        XCTAssertTrue(networkError.localizedDescription.contains("Network"))
+        
+        let fileNotFound = ModelDownloadError.fileNotFound("model.safetensors")
+        XCTAssertTrue(fileNotFound.localizedDescription.contains("not found"))
+        
+        let diskSpace = ModelDownloadError.insufficientDiskSpace(required: 10_000_000_000, available: 1_000_000_000)
+        XCTAssertTrue(diskSpace.localizedDescription.contains("GB"))
+    }
+    
+    func testListCachedModels() async {
+        let downloader = ModelDownloader.shared
+        let cached = await downloader.listCachedModels()
+        
+        // Should return an array (may be empty if no models cached)
+        XCTAssertNotNil(cached)
+    }
+    
+    func testGetCacheSize() async {
+        let downloader = ModelDownloader.shared
+        let size = await downloader.getCacheSize()
+        
+        // Cache size should be non-negative
+        XCTAssertGreaterThanOrEqual(size, 0)
+    }
+    
+    // MARK: - ModelWeightConfig Tests
+    
+    func testModelWeightConfigForQwen3Tiers() {
+        let entryConfig = ModelWeightConfig.forQwen3(tier: .entry)
+        XCTAssertEqual(entryConfig.vocabSize, 151936)
+        XCTAssertEqual(entryConfig.hiddenSize, 2560)
+        XCTAssertEqual(entryConfig.numLayers, 36)
+        
+        let proConfig = ModelWeightConfig.forQwen3(tier: .pro)
+        XCTAssertEqual(proConfig.vocabSize, 152064)
+        XCTAssertEqual(proConfig.hiddenSize, 3584)
+        XCTAssertEqual(proConfig.numLayers, 28)
+        
+        let eliteConfig = ModelWeightConfig.forQwen3(tier: .elite)
+        XCTAssertEqual(eliteConfig.vocabSize, 152064)
+        XCTAssertEqual(eliteConfig.hiddenSize, 5120)
+        XCTAssertEqual(eliteConfig.numLayers, 64)
+    }
+    
+    func testQwen3_0_6BConfig() {
+        let config = ModelWeightConfig.qwen3_0_6B
+        XCTAssertEqual(config.vocabSize, 151936)
+        XCTAssertEqual(config.hiddenSize, 1024)
+        XCTAssertEqual(config.numLayers, 28)
+        XCTAssertEqual(config.numHeads, 16)
+        XCTAssertEqual(config.numKVHeads, 2)
+    }
+    
+    // MARK: - WeightLoader Tests
+    
+    func testWeightKeyMapping() {
+        let originalWeights: [String: MLXArray] = [
+            "model.embed_tokens.weight": MLXArray([1.0, 2.0]),
+            "model.layers.0.self_attn.q_proj.weight": MLXArray([3.0, 4.0]),
+            "model.layers.0.input_layernorm.weight": MLXArray([5.0, 6.0])
+        ]
+        
+        let mapped = WeightLoader.mapWeightKeys(originalWeights)
+        
+        // "model." prefix should be removed
+        XCTAssertNotNil(mapped["embed_tokens.weight"])
+        XCTAssertNil(mapped["model.embed_tokens.weight"])
+        
+        // Keys should be mapped to camelCase
+        XCTAssertNotNil(mapped["layers.0.selfAttn.qProj.weight"])
+        XCTAssertNotNil(mapped["layers.0.inputLayerNorm.weight"])
+    }
+    
+    // MARK: - DrafterError Tests
+    
+    func testDrafterErrorDescriptions() {
+        let shapeMismatch = DrafterError.shapeMismatch("Expected [100, 200], got [50, 100]")
+        XCTAssertTrue(shapeMismatch.localizedDescription.contains("Shape mismatch"))
+        
+        let weightLoadingFailed = DrafterError.weightLoadingFailed("File not found")
+        XCTAssertTrue(weightLoadingFailed.localizedDescription.contains("Weight loading failed"))
+        
+        let modelNotLoaded = DrafterError.modelNotLoaded
+        XCTAssertTrue(modelNotLoaded.localizedDescription.contains("not been loaded"))
+        
+        let configMismatch = DrafterError.configurationMismatch("Vocab size differs")
+        XCTAssertTrue(configMismatch.localizedDescription.contains("Configuration mismatch"))
+    }
+    
+    // MARK: - TargetModel Tests
+    
+    func testTargetModelInitialization() async throws {
+        let config = ModelConfiguration.forTier(.entry)
+        let model = TargetModel(configuration: config, tier: .entry)
+        
+        // Before loading, model should not be loaded
+        let isLoaded = await model.checkLoaded()
+        XCTAssertFalse(isLoaded)
+    }
+    
+    func testTargetModelDimensions() async throws {
+        let config = ModelConfiguration.forTier(.entry)
+        let model = TargetModel(configuration: config, tier: .entry)
+        
+        // Attempt to load (will use tier-based initialization without network)
+        do {
+            try await model.loadModel()
+        } catch {
+            // Expected to fail without network/weights, but model should be partially initialized
+        }
+        
+        // Check dimensions are set (even if loading failed, tier-based defaults should be used)
+        let vocabSize = await model.getVocabSize()
+        let hiddenSize = await model.getHiddenSize()
+        let numLayers = await model.getNumLayers()
+        
+        // Should have valid dimensions from tier-based defaults
+        XCTAssertGreaterThan(vocabSize, 0)
+        XCTAssertGreaterThan(hiddenSize, 0)
+        XCTAssertGreaterThan(numLayers, 0)
+    }
+    
+    func testTargetModelStatistics() async throws {
+        let config = ModelConfiguration.forTier(.entry)
+        let model = TargetModel(configuration: config, tier: .entry)
+        
+        // Initial statistics should be zero
+        let (totalTokens, totalVerifications) = await model.getStatistics()
+        XCTAssertEqual(totalTokens, 0)
+        XCTAssertEqual(totalVerifications, 0)
+        
+        // Reset should not throw
+        await model.resetStatistics()
+        
+        let (afterResetTokens, afterResetVerifications) = await model.getStatistics()
+        XCTAssertEqual(afterResetTokens, 0)
+        XCTAssertEqual(afterResetVerifications, 0)
+    }
+    
+    // MARK: - DrafterActor Tests
+    
+    func testFastRLDrafterActorInitialization() async throws {
+        let config = SingleLayerDrafterConfig.forQwen3(size: "0.6B")
+        let loadMonitor = GPULoadMonitor()
+        
+        let drafter = FastRLDrafterActor(
+            config: config,
+            learningRate: 1e-4,
+            loadMonitor: loadMonitor
+        )
+        
+        // Initial state
+        let isLoaded = await drafter.isWeightsLoaded()
+        XCTAssertFalse(isLoaded)
+        
+        let modelId = await drafter.getModelId()
+        XCTAssertNil(modelId)
+        
+        let acceptanceRate = await drafter.getAcceptanceRate()
+        XCTAssertEqual(acceptanceRate, 0)
+        
+        let trainingStep = await drafter.getTrainingStep()
+        XCTAssertEqual(trainingStep, 0)
+    }
+    
+    func testFastRLDrafterActorBufferManagement() async throws {
+        let config = SingleLayerDrafterConfig.forQwen3(size: "0.6B")
+        let loadMonitor = GPULoadMonitor()
+        
+        let drafter = FastRLDrafterActor(
+            config: config,
+            learningRate: 1e-4,
+            loadMonitor: loadMonitor
+        )
+        
+        // Collect training data
+        await drafter.collectTrainingData(
+            hiddenStates: MLXArray([Float](repeating: 0.1, count: 1024)),
+            tokenIds: MLXArray([Int32(1), Int32(2), Int32(3)]),
+            targetLogits: MLXArray([Float](repeating: 0.01, count: 151936))
+        )
+        
+        let bufferSize = await drafter.getBufferSize()
+        XCTAssertEqual(bufferSize, 1)
+        
+        // Clear buffer
+        await drafter.clearBuffer()
+        let clearedSize = await drafter.getBufferSize()
+        XCTAssertEqual(clearedSize, 0)
+    }
+    
+    func testDrafterActorInitialization() async throws {
+        let config = DrafterConfig.qwen3_0_6B
+        let loadMonitor = GPULoadMonitor()
+        
+        let drafter = DrafterActor(
+            config: config,
+            enableEAGLE: true,
+            enableLoRA: false,
+            learningRate: 1e-4,
+            loadMonitor: loadMonitor
+        )
+        
+        // Initial state
+        let isLoaded = await drafter.isWeightsLoaded()
+        XCTAssertFalse(isLoaded)
+        
+        let modelId = await drafter.getModelId()
+        XCTAssertNil(modelId)
+        
+        let acceptanceRate = await drafter.getAcceptanceRate()
+        XCTAssertEqual(acceptanceRate, 0)
+        
+        let isTraining = await drafter.isTraining()
+        XCTAssertTrue(isTraining) // EAGLE is enabled
+    }
+    
+    func testDrafterActorTrainingToggle() async throws {
+        let config = DrafterConfig.qwen3_0_6B
+        let loadMonitor = GPULoadMonitor()
+        
+        let drafter = DrafterActor(
+            config: config,
+            enableEAGLE: true,
+            enableLoRA: false,
+            learningRate: 1e-4,
+            loadMonitor: loadMonitor
+        )
+        
+        // Initially enabled (EAGLE is on)
+        var isTraining = await drafter.isTraining()
+        XCTAssertTrue(isTraining)
+        
+        // Disable training
+        await drafter.setTrainingEnabled(false)
+        isTraining = await drafter.isTraining()
+        XCTAssertFalse(isTraining)
+        
+        // Re-enable training
+        await drafter.setTrainingEnabled(true)
+        isTraining = await drafter.isTraining()
+        XCTAssertTrue(isTraining)
+    }
+    
+    // MARK: - SingleLayerDrafterConfig Tests
+    
+    func testSingleLayerDrafterConfigForQwen3Sizes() {
+        let config06B = SingleLayerDrafterConfig.forQwen3(size: "0.6B")
+        XCTAssertEqual(config06B.hiddenSize, 1024)
+        XCTAssertEqual(config06B.vocabSize, 151936)
+        
+        let config4B = SingleLayerDrafterConfig.forQwen3(size: "4B")
+        XCTAssertEqual(config4B.hiddenSize, 3072)
+        XCTAssertEqual(config4B.vocabSize, 152064)
+        
+        let config7B = SingleLayerDrafterConfig.forQwen3(size: "7B")
+        XCTAssertEqual(config7B.hiddenSize, 4096)
+        XCTAssertEqual(config7B.vocabSize, 152064)
+        
+        let config32B = SingleLayerDrafterConfig.forQwen3(size: "32B")
+        XCTAssertEqual(config32B.hiddenSize, 5120)
+        XCTAssertEqual(config32B.vocabSize, 152064)
+        
+        // Unknown size should default to 7B
+        let configUnknown = SingleLayerDrafterConfig.forQwen3(size: "unknown")
+        XCTAssertEqual(configUnknown.hiddenSize, 4096)
+    }
+}

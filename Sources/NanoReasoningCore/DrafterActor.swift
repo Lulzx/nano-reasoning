@@ -8,6 +8,29 @@ import MLXNN
 import MLXOptimizers
 import MLXRandom
 
+// MARK: - Drafter Errors
+
+/// Errors specific to drafter operations
+public enum DrafterError: Error, LocalizedError {
+    case shapeMismatch(String)
+    case weightLoadingFailed(String)
+    case modelNotLoaded
+    case configurationMismatch(String)
+    
+    public var errorDescription: String? {
+        switch self {
+        case .shapeMismatch(let msg):
+            return "Shape mismatch: \(msg)"
+        case .weightLoadingFailed(let msg):
+            return "Weight loading failed: \(msg)"
+        case .modelNotLoaded:
+            return "Drafter model has not been loaded"
+        case .configurationMismatch(let msg):
+            return "Configuration mismatch: \(msg)"
+        }
+    }
+}
+
 /// Training sample for the drafter model
 public struct TrainingSample: @unchecked Sendable {
     /// Hidden states from target model
@@ -460,6 +483,10 @@ public actor FastRLDrafterActor {
     private var trainingBuffer: [(hiddenStates: MLXArray, tokenIds: MLXArray, targetLogits: MLXArray)] = []
     private let maxBufferSize: Int = 256
     
+    // Model loading state
+    private var weightsLoaded: Bool = false
+    private var modelId: String?
+    
     public init(
         config: SingleLayerDrafterConfig,
         learningRate: Float = 1e-4,
@@ -469,6 +496,78 @@ public actor FastRLDrafterActor {
         self.drafter = SingleLayerEAGLEDrafter(config: config)
         self.optimizer = Adam(learningRate: learningRate)
         self.loadMonitor = loadMonitor
+    }
+    
+    /// Load drafter weights from HuggingFace Hub
+    /// - Parameters:
+    ///   - modelId: HuggingFace model ID (e.g., "Qwen/Qwen3-0.6B")
+    ///   - progressHandler: Optional progress callback
+    /// - Returns: True if weights were loaded successfully
+    public func loadFromHuggingFace(
+        modelId: String,
+        progressHandler: (@Sendable (DownloadProgress) -> Void)? = nil
+    ) async throws -> Bool {
+        self.modelId = modelId
+        
+        let downloadConfig = ModelDownloadConfig(modelId: modelId)
+        
+        do {
+            let downloaded = try await ModelDownloader.shared.downloadModel(
+                config: downloadConfig,
+                progressHandler: progressHandler
+            )
+            
+            // Load weights from downloaded safetensors
+            try loadWeights(from: downloaded.weightsPath)
+            
+            // Validate shapes
+            try validateDrafterShapes()
+            
+            weightsLoaded = true
+            return true
+        } catch {
+            print("Warning: Could not download drafter model (\(error))")
+            return false
+        }
+    }
+    
+    /// Validate drafter weight shapes match configuration
+    private func validateDrafterShapes() throws {
+        let params = drafter.parameters().flattened()
+        
+        // Validate embedding
+        for (key, value) in params {
+            if key.contains("embedTokens") && key.contains("weight") {
+                guard value.shape.count == 2,
+                      value.shape[0] == config.vocabSize,
+                      value.shape[1] == config.hiddenSize else {
+                    throw DrafterError.shapeMismatch(
+                        "Embedding shape mismatch: expected [\(config.vocabSize), \(config.hiddenSize)], got \(value.shape)"
+                    )
+                }
+            }
+            
+            // Validate LM head
+            if key.contains("lmHead") && key.contains("weight") {
+                guard value.shape.count == 2,
+                      value.shape[0] == config.vocabSize,
+                      value.shape[1] == config.hiddenSize else {
+                    throw DrafterError.shapeMismatch(
+                        "LM head shape mismatch: expected [\(config.vocabSize), \(config.hiddenSize)], got \(value.shape)"
+                    )
+                }
+            }
+        }
+    }
+    
+    /// Check if weights are loaded
+    public func isWeightsLoaded() -> Bool {
+        weightsLoaded
+    }
+    
+    /// Get the model ID if loaded from HuggingFace
+    public func getModelId() -> String? {
+        modelId
     }
     
     /// Generate draft tokens
@@ -751,6 +850,10 @@ public actor DrafterActor {
     private var totalDrafts: Int = 0
     private var acceptedDrafts: Int = 0
     
+    // Model loading state
+    private var weightsLoaded: Bool = false
+    private var modelId: String?
+    
     public init(
         config: DrafterConfig,
         enableEAGLE: Bool,
@@ -763,6 +866,78 @@ public actor DrafterActor {
         self.optimizer = Adam(learningRate: learningRate)
         self.loadMonitor = loadMonitor
         self.isTrainingEnabled = enableEAGLE || enableLoRA
+    }
+    
+    /// Load drafter weights from HuggingFace Hub
+    /// - Parameters:
+    ///   - modelId: HuggingFace model ID (e.g., "Qwen/Qwen3-0.6B")
+    ///   - progressHandler: Optional progress callback
+    /// - Returns: True if weights were loaded successfully
+    public func loadFromHuggingFace(
+        modelId: String,
+        progressHandler: (@Sendable (DownloadProgress) -> Void)? = nil
+    ) async throws -> Bool {
+        self.modelId = modelId
+        
+        let downloadConfig = ModelDownloadConfig(modelId: modelId)
+        
+        do {
+            let downloaded = try await ModelDownloader.shared.downloadModel(
+                config: downloadConfig,
+                progressHandler: progressHandler
+            )
+            
+            // Load weights from downloaded safetensors
+            try loadWeights(from: downloaded.weightsPath)
+            
+            // Validate shapes
+            try validateDrafterShapes()
+            
+            weightsLoaded = true
+            return true
+        } catch {
+            print("Warning: Could not download drafter model (\(error))")
+            return false
+        }
+    }
+    
+    /// Validate drafter weight shapes match configuration
+    private func validateDrafterShapes() throws {
+        let params = model.parameters().flattened()
+        
+        // Validate embedding
+        for (key, value) in params {
+            if key.contains("embedTokens") && key.contains("weight") {
+                guard value.shape.count == 2,
+                      value.shape[0] == config.vocabSize,
+                      value.shape[1] == config.hiddenSize else {
+                    throw DrafterError.shapeMismatch(
+                        "Embedding shape mismatch: expected [\(config.vocabSize), \(config.hiddenSize)], got \(value.shape)"
+                    )
+                }
+            }
+            
+            // Validate LM head
+            if key.contains("lmHead") && key.contains("weight") {
+                guard value.shape.count == 2,
+                      value.shape[0] == config.vocabSize,
+                      value.shape[1] == config.hiddenSize else {
+                    throw DrafterError.shapeMismatch(
+                        "LM head shape mismatch: expected [\(config.vocabSize), \(config.hiddenSize)], got \(value.shape)"
+                    )
+                }
+            }
+        }
+    }
+    
+    /// Check if weights are loaded
+    public func isWeightsLoaded() -> Bool {
+        weightsLoaded
+    }
+    
+    /// Get the model ID if loaded from HuggingFace
+    public func getModelId() -> String? {
+        modelId
     }
     
 
