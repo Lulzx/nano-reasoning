@@ -356,6 +356,7 @@ public actor TargetModel {
     private var vocabSize: Int = 0
     private var hiddenSize: Int = 0
     private var numLayers: Int = 0
+    private var weightsLoaded: Bool = false
     
     // Statistics
     private var totalTokensGenerated: Int = 0
@@ -423,8 +424,93 @@ public actor TargetModel {
         
         kvCache = KVCache(numLayers: numLayers)
         
+        // Attempt to load pretrained weights if available
+        if let weightsURL = resolveWeightsURL() {
+            do {
+                try loadPretrainedWeights(from: weightsURL)
+                weightsLoaded = true
+            } catch {
+                // Fallback to randomly initialized weights
+                print("Warning: Failed to load pretrained weights at \(weightsURL.path): \(error)")
+            }
+        }
+        
         progressHandler?(1.0)
         isLoaded = true
+    }
+    
+    /// Resolve weights path (env override or cache directory)
+    private func resolveWeightsURL() -> URL? {
+        if let env = EnvironmentConfig.modelWeightsPath {
+            return env
+        }
+        
+        // Default cache path: ~/.cache/nano-reasoning/models/<modelId>/weights.safetensors
+        let safeId = configuration.targetModelId.replacingOccurrences(of: "/", with: "_")
+        let defaultPath = EnvironmentConfig.modelCacheDirectory
+            .appendingPathComponent(safeId)
+            .appendingPathComponent("weights.safetensors")
+        if FileManager.default.fileExists(atPath: defaultPath.path) {
+            return defaultPath
+        }
+        return nil
+    }
+    
+    /// Load pretrained weights from safetensors (best-effort mapping)
+    private func loadPretrainedWeights(from url: URL) throws {
+        let arrays = try loadArrays(url: url)
+        // Apply to embedding
+        if var embed = embedTokens {
+            var params = ModuleParameters()
+            for (k, v) in arrays where k.contains("embed") || k.contains("token_embedding") {
+                params[k] = .value(v)
+            }
+            embed.update(parameters: params)
+            embedTokens = embed
+        }
+        
+        // Apply to layers (best effort by index)
+        for (idx, layer) in layers.enumerated() {
+            var params = ModuleParameters()
+            for (k, v) in arrays where k.contains("layers.\(idx)") {
+                let cleaned = k.replacingOccurrences(of: "layers.\(idx).", with: "")
+                params[cleaned] = .value(v)
+            }
+            layer.update(parameters: params)
+        }
+        
+        // Norm and LM head
+        if var finalNorm = norm {
+            var params = ModuleParameters()
+            for (k, v) in arrays where k.contains("norm") {
+                params[k.replacingOccurrences(of: "norm.", with: "")] = .value(v)
+            }
+            finalNorm.update(parameters: params)
+            norm = finalNorm
+        }
+        
+        // Quantization: apply fake quantization for int4/int8 configs
+        switch configuration.targetQuantization {
+        case .int4:
+            applyQuantization(.int4)
+        case .int8:
+            applyQuantization(.int8)
+        default:
+            break
+        }
+    }
+    
+    /// Apply fake quantization to weights for memory savings (best effort)
+    private func applyQuantization(_ config: QuantizationConfig) {
+        if var head = lmHead {
+            var params = ModuleParameters()
+            for (key, arr) in head.parameters().flattened() {
+                let q = QuantizationUtils.fakeQuantize(arr, config: config)
+                params[key] = .value(q)
+            }
+            head.update(parameters: params)
+            lmHead = head
+        }
     }
     
     /// Check if model is loaded
@@ -496,7 +582,8 @@ public actor TargetModel {
     public func verifyDraftTokens(
         contextIds: MLXArray,
         draftTokens: [Int32],
-        config: GenerationConfig = .default
+        config: GenerationConfig = .default,
+        draftLogProbs: [Float]? = nil
     ) async throws -> VerificationResult {
         guard isLoaded else {
             throw TargetModelError.modelNotLoaded
@@ -521,14 +608,30 @@ public actor TargetModel {
             
             if position >= 0 && position < logits.shape[1] {
                 let tokenLogits = logits[0, position]
-                let predictedToken = sampleToken(logits: tokenLogits, config: config)
                 
-                if predictedToken == draftToken {
-                    acceptanceMask.append(true)
+                if let draftLogProbs = draftLogProbs, draftLogProbs.count > index {
+                    // Lossless acceptance: accept with probability min(1, p_t / p_d)
+                    let targetProbs = MLX.softmax(tokenLogits / config.temperature)
+                    let targetProb = targetProbs[Int(draftToken)].item(Float.self)
+                    let draftProb = exp(draftLogProbs[index])
+                    let acceptanceProb = min(1.0, targetProb / max(draftProb, 1e-8))
+                    let r = Float.random(in: 0...1)
+                    let accepted = r < acceptanceProb
+                    acceptanceMask.append(accepted)
+                    if !accepted {
+                        let newToken = sampleToken(logits: tokenLogits, config: config)
+                        correctedToken = newToken
+                        break
+                    }
                 } else {
-                    acceptanceMask.append(false)
-                    correctedToken = predictedToken
-                    break
+                    let predictedToken = sampleToken(logits: tokenLogits, config: config)
+                    if predictedToken == draftToken {
+                        acceptanceMask.append(true)
+                    } else {
+                        acceptanceMask.append(false)
+                        correctedToken = predictedToken
+                        break
+                    }
                 }
             } else {
                 acceptanceMask.append(false)

@@ -57,6 +57,7 @@ public actor Orchestrator {
     private var trainerTask: TrainerTask?
     private var loadMonitor: GPULoadMonitor
     private var tokenizerManager: TokenizerManager?
+    private var adaptiveEngine: AdaptiveRolloutEngine?
     
     // FastRL components (lightweight single-layer drafter)
     private var fastRLDrafter: FastRLDrafterActor?
@@ -117,6 +118,7 @@ public actor Orchestrator {
         }
         
         state = .loading
+        prepareCacheDirectories()
         
         do {
             // Initialize target model
@@ -154,9 +156,18 @@ public actor Orchestrator {
                 )
             }
             
+            // Adaptive rollout engine with MAB scheduling
+            adaptiveEngine = AdaptiveRolloutEngine(
+                drafter: drafterActor!,
+                target: targetModel!,
+                trainingBuffer: trainingBuffer,
+                loadMonitor: loadMonitor,
+                enableAdaptiveTraining: hardwareProfile.tier.trainingEnabled
+            )
+            
             // Initialize tokenizer
             progressHandler?("Loading tokenizer...", 0.9)
-            tokenizerManager = TokenizerManager(config: .qwen2_5)
+            tokenizerManager = TokenizerManager(config: .qwen3)
             try await tokenizerManager?.load()
             
             progressHandler?("Ready!", 1.0)
@@ -174,6 +185,7 @@ public actor Orchestrator {
             await fastRLDecoder?.startBackgroundTraining()
         } else {
             await trainerTask?.start()
+            await adaptiveEngine?.startAdaptiveTraining()
         }
     }
     
@@ -183,6 +195,7 @@ public actor Orchestrator {
             await fastRLDecoder?.stopBackgroundTraining()
         } else {
             await trainerTask?.stop()
+            await adaptiveEngine?.stopAdaptiveTraining()
         }
     }
     
@@ -206,7 +219,7 @@ public actor Orchestrator {
             
             // Initialize FastRL lightweight drafter (single-layer EAGLE head)
             progressHandler?("Initializing FastRL drafter...", 0.6)
-            let drafterConfig = SingleLayerDrafterConfig.forQwen2_5(size: getTargetModelSize())
+            let drafterConfig = SingleLayerDrafterConfig.forQwen3(size: getTargetModelSize())
             fastRLDrafter = FastRLDrafterActor(
                 config: drafterConfig,
                 learningRate: 1e-4,
@@ -221,9 +234,11 @@ public actor Orchestrator {
                 loadMonitor: loadMonitor
             )
             
+            adaptiveEngine = nil
+            
             // Initialize tokenizer
             progressHandler?("Loading tokenizer...", 0.9)
-            tokenizerManager = TokenizerManager(config: .qwen2_5)
+            tokenizerManager = TokenizerManager(config: .qwen3)
             try await tokenizerManager?.load()
             
             progressHandler?("Ready (FastRL mode)!", 1.0)
@@ -239,7 +254,7 @@ public actor Orchestrator {
     private func getTargetModelSize() -> String {
         switch hardwareProfile.tier {
         case .entry:
-            return "3B"
+            return "4B"
         case .pro:
             return "7B"
         case .elite:
@@ -273,6 +288,7 @@ public actor Orchestrator {
             step: stats?.step ?? 0,
             loss: stats?.loss ?? 0,
             acceptanceRate: stats?.acceptanceRate ?? 0,
+            acceptanceLength: sessionStats?.averageAcceptanceRate ?? 0,
             timestamp: Date(),
             tier: hardwareProfile.tier
         )
@@ -301,10 +317,6 @@ public actor Orchestrator {
             throw OrchestratorError.invalidState("Orchestrator not ready")
         }
         
-        guard let target = targetModel, let drafter = drafterActor else {
-            throw OrchestratorError.componentNotInitialized
-        }
-        
         state = .generating
         let startTime = Date()
         
@@ -313,107 +325,84 @@ public actor Orchestrator {
             config.maxTokens = max
         }
         
-        // Convert prompt text to token IDs
+        // Convert prompt text to token IDs and add batch dimension for engines
         let promptTokens = try await tokenize(prompt)
-        var contextTokens = promptTokens
+        let promptArray = MLXArray(promptTokens)
+        
         var generatedTokens: [Int32] = []
+        var draftedCount = 0
+        var acceptedCount = 0
+        var verificationCalls = 0
+        var elapsed: TimeInterval = 0
         
-        let draftCount = hardwareProfile.tier.draftCount
-        var localDrafted = 0
-        var localAccepted = 0
-        var localVerifications = 0
+        if useFastRLMode {
+            guard let decoder = fastRLDecoder else {
+                state = .ready
+                throw OrchestratorError.componentNotInitialized
+            }
+            
+            let (tokensResult, draftedResult, acceptedResult, elapsedResult) = try await decoder.generate(
+                context: promptArray,
+                maxTokens: config.maxTokens,
+                temperature: config.temperature,
+                topK: config.topK
+            )
+            generatedTokens = tokensResult
+            draftedCount = draftedResult
+            acceptedCount = acceptedResult
+            elapsed = elapsedResult
+        } else if let engine = adaptiveEngine {
+            let (tokensResult, draftedResult, acceptedResult, elapsedResult) = try await engine.generate(
+                context: promptArray,
+                maxTokens: config.maxTokens,
+                generationConfig: config
+            )
+            generatedTokens = tokensResult
+            draftedCount = draftedResult
+            acceptedCount = acceptedResult
+            elapsed = elapsedResult
+        } else if let target = targetModel {
+            // Fallback to standard generation if engines are unavailable
+            let promptFlat = MLXArray(promptTokens)
+            let tokens = try await target.generate(prompt: promptFlat, config: config, tokenCallback: nil)
+            generatedTokens = tokens
+            draftedCount = tokens.count
+            acceptedCount = tokens.count
+        } else {
+            state = .ready
+            throw OrchestratorError.componentNotInitialized
+        }
         
-        while generatedTokens.count < config.maxTokens {
-            // Generate draft tokens - create separate arrays to avoid data race
-            let contextForDraft = MLXArray(contextTokens)
-            let (_, hiddenStates) = try await target.getLogitsAndHiddenStates(inputIds: contextForDraft)
-            
-            let contextForGenerate = MLXArray(contextTokens)
-            let draftTokens = await drafter.generateDraft(
-                hiddenStates: hiddenStates,
-                previousTokens: contextForGenerate,
-                count: draftCount,
-                temperature: config.temperature
-            )
-            localDrafted += draftTokens.count
-            
-            // Verify draft tokens - create another context array
-            let contextForVerify = MLXArray(contextTokens)
-            let verificationResult = try await target.verifyDraftTokens(
-                contextIds: contextForVerify,
-                draftTokens: draftTokens,
-                config: config
-            )
-            localVerifications += 1
-            
-            // Accept verified tokens
-            let acceptedCount = verificationResult.acceptedCount
-            localAccepted += acceptedCount
-            
-            for i in 0..<acceptedCount {
-                let token = draftTokens[i]
-                contextTokens.append(token)
-                generatedTokens.append(token)
-                
-                // Stream token if callback provided
-                if let callback = tokenCallback {
-                    let tokenText = try await detokenize([token])
-                    let shouldContinue = await callback(tokenText)
-                    if !shouldContinue {
-                        break
-                    }
-                }
-                
-                // Check for stop tokens
-                if config.stopTokens.contains(token) {
-                    break
-                }
-            }
-            
-            // Add corrected token if any draft was rejected
-            if let corrected = verificationResult.correctedToken {
-                contextTokens.append(corrected)
-                generatedTokens.append(corrected)
-                
-                if let callback = tokenCallback {
-                    let tokenText = try await detokenize([corrected])
-                    _ = await callback(tokenText)
-                }
-            }
-            
-            // Push rejection data to training buffer
-            if hardwareProfile.tier.trainingEnabled && acceptedCount < draftTokens.count {
-                await pushTrainingData(
-                    hiddenStates: verificationResult.hiddenStates,
-                    targetLogits: verificationResult.logits,
-                    inputIds: contextForVerify,
-                    rejectedCount: draftTokens.count - acceptedCount
-                )
-            }
-            
-            // Record acceptance statistics
-            await drafter.recordAcceptance(accepted: acceptedCount, total: draftTokens.count)
-            
-            // Check if we hit a stop condition
-            if let lastToken = generatedTokens.last, config.stopTokens.contains(lastToken) {
-                break
+        // Stream tokens if requested
+        if let callback = tokenCallback {
+            for token in generatedTokens {
+                let tokenText = try await detokenize([token])
+                let shouldContinue = await callback(tokenText)
+                if !shouldContinue { break }
             }
         }
         
+        // Estimate verification calls based on drafted tokens
+        if draftedCount > 0 {
+            let k = max(1, hardwareProfile.tier.draftCount)
+            verificationCalls = max(1, (draftedCount + k - 1) / k)
+        }
+        
+        let measuredElapsed = elapsed > 0 ? elapsed : Date().timeIntervalSince(startTime)
+        
         // Update statistics
-        let elapsed = Date().timeIntervalSince(startTime)
         totalTokensGenerated += generatedTokens.count
-        totalDraftedTokens += localDrafted
-        totalAcceptedTokens += localAccepted
-        totalVerifications += localVerifications
+        totalDraftedTokens += draftedCount
+        totalAcceptedTokens += acceptedCount
+        totalVerifications += verificationCalls
         
         sessionStats = GenerationStatistics(
             totalTokens: generatedTokens.count,
-            draftedTokens: localDrafted,
-            acceptedTokens: localAccepted,
-            rejectedTokens: localDrafted - localAccepted,
-            verificationCalls: localVerifications,
-            elapsedTime: elapsed
+            draftedTokens: draftedCount,
+            acceptedTokens: acceptedCount,
+            rejectedTokens: draftedCount - acceptedCount,
+            verificationCalls: verificationCalls,
+            elapsedTime: measuredElapsed
         )
         
         state = .ready
@@ -473,7 +462,9 @@ public actor Orchestrator {
             hiddenStates: hiddenStates,
             targetLogits: targetLogits,
             inputIds: inputIds,
-            rejectedCount: rejectedCount
+            rejectedCount: rejectedCount,
+            rejectionPositions: [],
+            contextLength: inputIds.shape[inputIds.ndim - 1]
         )
     }
     
@@ -486,6 +477,11 @@ public actor Orchestrator {
             throw OrchestratorError.tokenizationFailed("Tokenizer not initialized")
         }
         return try await tokenizer.encode(text)
+    }
+    
+    /// Public helper to tokenize text for external consumers (RL rollout, etc.)
+    public func tokenizeText(_ text: String) async throws -> [Int32] {
+        try await tokenize(text)
     }
     
     private func detokenize(_ tokens: [Int32]) async throws -> String {
@@ -565,6 +561,54 @@ public actor Orchestrator {
     /// Get generation configuration
     public func getGenerationConfig() -> GenerationConfig {
         generationConfig
+    }
+    
+    /// Internal accessor for target model (read-only)
+    public func getTargetModelActor() -> TargetModel? {
+        targetModel
+    }
+    
+    /// Internal accessor for tokenizer manager
+    public func getTokenizerManager() -> TokenizerManager? {
+        tokenizerManager
+    }
+    
+    /// Ensure cache/checkpoint directories exist
+    private func prepareCacheDirectories() {
+        let fm = FileManager.default
+        let cacheDirs = [
+            EnvironmentConfig.modelCacheDirectory,
+            EnvironmentConfig.checkpointDirectory
+        ]
+        for dir in cacheDirs {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+    }
+    
+    /// Run a lightweight evaluation over prompts and return throughput/acceptance stats
+    public func evaluate(
+        prompts: [String],
+        maxTokens: Int
+    ) async throws -> (tokensPerSecond: Float, acceptanceRate: Float) {
+        var totalTokens: Int = 0
+        var totalDrafted: Int = 0
+        var totalAccepted: Int = 0
+        let start = Date()
+        
+        for prompt in prompts {
+            let _ = try await generate(prompt: prompt, maxTokens: maxTokens, tokenCallback: nil)
+            if let stats = getSessionStatistics() {
+                totalTokens += stats.totalTokens
+                totalDrafted += stats.draftedTokens
+                totalAccepted += stats.acceptedTokens
+            }
+            await resetStatistics()
+        }
+        
+        let elapsed = Date().timeIntervalSince(start)
+        let tps = elapsed > 0 ? Float(totalTokens) / Float(elapsed) : 0
+        let acceptance = totalDrafted > 0 ? Float(totalAccepted) / Float(totalDrafted) : 0
+        return (tps, acceptance)
     }
 }
 

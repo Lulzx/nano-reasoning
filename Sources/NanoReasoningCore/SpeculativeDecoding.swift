@@ -356,8 +356,13 @@ public actor AdaptiveRolloutEngine {
         context: MLXArray,
         maxTokens: Int,
         generationConfig: GenerationConfig
-    ) async throws -> (tokens: [Int32], hiddenStates: MLXArray?) {
-        let batchSize = context.shape[0]
+    ) async throws -> (
+        tokens: [Int32],
+        drafted: Int,
+        accepted: Int,
+        elapsed: TimeInterval
+    ) {
+        let batchSize = context.ndim > 1 ? context.shape[0] : 1
         let contextLength = context.shape[context.ndim - 1]
         
         // Decide whether to use SD
@@ -450,7 +455,12 @@ public actor AdaptiveRolloutEngine {
             
             recordGenerationLength(allTokens.count)
             
-            return (Array(allTokens.prefix(maxTokens)), lastHiddenStates)
+            return (
+                Array(allTokens.prefix(maxTokens)),
+                totalDrafted,
+                totalAccepted,
+                elapsed
+            )
         } else {
             // Standard autoregressive generation with hidden state collection
             let startTime = Date()
@@ -514,8 +524,8 @@ public actor AdaptiveRolloutEngine {
             
             recordGenerationLength(tokens.count)
             
-            return (tokens, nil)
-        }
+        return (tokens, tokens.count, tokens.count, elapsed)
+    }
     }
     
     /// Get current performance statistics
@@ -618,19 +628,21 @@ public actor SpeculativeDecoder {
         let (_, hiddenStates) = try await target.getLogitsAndHiddenStates(inputIds: context)
         
         // Step 2: Generate draft tokens
-        let draftTokens = await drafter.generateDraft(
+        let draft = await drafter.generateDraftWithLogProbs(
             hiddenStates: hiddenStates,
             previousTokens: context,
             count: config.draftCount,
             temperature: config.draftTemperature
         )
+        let draftTokens = draft.tokens
         totalDrafted += draftTokens.count
         
         // Step 3: Verify draft tokens with target model
         let verification = try await target.verifyDraftTokens(
             contextIds: context,
             draftTokens: draftTokens,
-            config: generationConfig
+            config: generationConfig,
+            draftLogProbs: draft.logProbs
         )
         
         // Step 4: Determine accepted tokens
@@ -653,11 +665,16 @@ public actor SpeculativeDecoder {
         // Step 6: Push training data if we have rejections
         if let buffer = trainingBuffer, acceptedTokens.count < draftTokens.count {
             let rejectedCount = draftTokens.count - acceptedTokens.count
+            let rejectionPositions = verification.acceptanceMask.enumerated().compactMap { idx, accepted in
+                accepted ? nil : idx
+            }
             await buffer.pushRejectionData(
                 hiddenStates: verification.hiddenStates,
                 targetLogits: verification.logits,
                 inputIds: context,
-                rejectedCount: rejectedCount
+                rejectedCount: rejectedCount,
+                rejectionPositions: rejectionPositions,
+                contextLength: context.shape[context.ndim - 1]
             )
         }
         
@@ -1646,10 +1663,15 @@ public actor FastRLSpeculativeDecoder {
         maxTokens: Int,
         temperature: Float = 1.0,
         topK: Int = 8
-    ) async throws -> (tokens: [Int32], hiddenStates: MLXArray?) {
+    ) async throws -> (
+        tokens: [Int32],
+        drafted: Int,
+        accepted: Int,
+        elapsed: TimeInterval
+    ) {
         totalGenerations += 1
         
-        let batchSize = context.shape[0]
+        let batchSize = context.ndim > 1 ? context.shape[0] : 1
         let contextLength = context.shape[context.ndim - 1]
         
         // Decide whether to use SD based on batch characteristics
@@ -1678,14 +1700,18 @@ public actor FastRLSpeculativeDecoder {
         maxTokens: Int,
         temperature: Float,
         topK: Int
-    ) async throws -> (tokens: [Int32], hiddenStates: MLXArray?) {
+    ) async throws -> (
+        tokens: [Int32],
+        drafted: Int,
+        accepted: Int,
+        elapsed: TimeInterval
+    ) {
         // Select MAB configuration
         let config = await mab.selectArm()
         currentConfig = config
         
         var generatedTokens: [Int32] = []
         var currentContext = context
-        var lastHiddenStates: MLXArray?
         var localAccepted = 0
         var localDrafted = 0
         
@@ -1694,20 +1720,20 @@ public actor FastRLSpeculativeDecoder {
         while generatedTokens.count < maxTokens {
             // Get hidden states and logits from target
             let (targetLogits, hiddenStates) = try await target.getLogitsAndHiddenStates(inputIds: currentContext)
-            lastHiddenStates = hiddenStates
             
             // Get last hidden state for drafter
             let lastHidden = hiddenStates[0, hiddenStates.shape[1] - 1].expandedDimensions(axis: 0)
             let lastToken = currentContext[currentContext.shape[0] - 1].expandedDimensions(axis: 0)
             
-            // Generate draft tokens using lightweight drafter
-            let draftTokens = await drafter.generateDrafts(
+            // Generate draft tokens using lightweight drafter (with log probs for lossless check)
+            let draft = await drafter.generateDraftsWithLogProbs(
                 hiddenState: lastHidden,
                 prevToken: lastToken,
                 count: config.steps,
                 temperature: temperature,
                 topK: config.topK
             )
+            let draftTokens = draft.tokens
             localDrafted += draftTokens.count
             
             // Verify drafts with target
@@ -1723,7 +1749,8 @@ public actor FastRLSpeculativeDecoder {
             let verifyResult = try await target.verifyDraftTokens(
                 contextIds: currentContext.squeezed(),
                 draftTokens: draftTokens,
-                config: genConfig
+                config: genConfig,
+                draftLogProbs: draft.logProbs
             )
             
             // Accept verified tokens
@@ -1763,8 +1790,13 @@ public actor FastRLSpeculativeDecoder {
         totalAccepted += localAccepted
         totalDrafted += localDrafted
         
-        return (Array(generatedTokens.prefix(maxTokens)), lastHiddenStates)
-    }
+        return (
+            Array(generatedTokens.prefix(maxTokens)),
+            localDrafted,
+            localAccepted,
+            elapsed
+        )
+        }
     
     /// Generate without speculative decoding (for small batches)
     private func generateStandard(
@@ -1772,14 +1804,18 @@ public actor FastRLSpeculativeDecoder {
         maxTokens: Int,
         temperature: Float,
         topK: Int
-    ) async throws -> (tokens: [Int32], hiddenStates: MLXArray?) {
+    ) async throws -> (
+        tokens: [Int32],
+        drafted: Int,
+        accepted: Int,
+        elapsed: TimeInterval
+    ) {
         var generatedTokens: [Int32] = []
         var currentContext = context
-        var lastHiddenStates: MLXArray?
+        let startTime = Date()
         
         for _ in 0..<maxTokens {
             let (logits, hiddenStates) = try await target.getLogitsAndHiddenStates(inputIds: currentContext)
-            lastHiddenStates = hiddenStates
             
             // Sample next token
             let lastLogits = logits[0, logits.shape[1] - 1]
@@ -1801,8 +1837,9 @@ public actor FastRLSpeculativeDecoder {
         totalTokensGenerated += generatedTokens.count
         totalAccepted += generatedTokens.count
         totalDrafted += generatedTokens.count
+        let elapsed = Date().timeIntervalSince(startTime)
         
-        return (generatedTokens, lastHiddenStates)
+        return (generatedTokens, generatedTokens.count, generatedTokens.count, elapsed)
     }
     
     /// Collect training data from inference

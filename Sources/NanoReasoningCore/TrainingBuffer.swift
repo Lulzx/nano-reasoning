@@ -41,16 +41,19 @@ public struct PrioritizedSample: Sendable {
     public let priority: SamplePriority
     public let timestamp: Date
     public let rejectionCount: Int  // How many tokens were rejected (higher = more valuable for learning)
+    public let isLongTail: Bool
     
     public init(
         sample: TrainingSample,
         priority: SamplePriority = .normal,
-        rejectionCount: Int = 0
+        rejectionCount: Int = 0,
+        isLongTail: Bool = false
     ) {
         self.sample = sample
         self.priority = priority
         self.timestamp = Date()
         self.rejectionCount = rejectionCount
+        self.isLongTail = isLongTail
     }
 }
 
@@ -87,13 +90,14 @@ public actor TrainingBuffer {
     /// Push a single sample into the buffer
     /// Returns true if sample was accepted, false if dropped due to capacity
     @discardableResult
-    public func push(sample: TrainingSample, priority: SamplePriority = .normal, rejectionCount: Int = 0) -> Bool {
+    public func push(sample: TrainingSample, priority: SamplePriority = .normal, rejectionCount: Int = 0, isLongTail: Bool = false) -> Bool {
         totalPushed += 1
         
         let prioritizedSample = PrioritizedSample(
             sample: sample,
             priority: priority,
-            rejectionCount: rejectionCount
+            rejectionCount: rejectionCount,
+            isLongTail: isLongTail
         )
         
         if buffer.count >= capacity {
@@ -114,10 +118,10 @@ public actor TrainingBuffer {
     }
     
     /// Push multiple samples (batch operation)
-    public func pushBatch(samples: [(TrainingSample, SamplePriority, Int)]) -> Int {
+    public func pushBatch(samples: [(TrainingSample, SamplePriority, Int, Bool)]) -> Int {
         var accepted = 0
-        for (sample, priority, rejectionCount) in samples {
-            if push(sample: sample, priority: priority, rejectionCount: rejectionCount) {
+        for (sample, priority, rejectionCount, isLongTail) in samples {
+            if push(sample: sample, priority: priority, rejectionCount: rejectionCount, isLongTail: isLongTail) {
                 accepted += 1
             }
         }
@@ -129,12 +133,16 @@ public actor TrainingBuffer {
         hiddenStates: MLXArray,
         targetLogits: MLXArray,
         inputIds: MLXArray,
-        rejectedCount: Int
+        rejectedCount: Int,
+        rejectionPositions: [Int] = [],
+        contextLength: Int? = nil
     ) {
         let sample = TrainingSample(
             hiddenStates: hiddenStates,
             targetLogits: targetLogits,
-            inputIds: inputIds
+            inputIds: inputIds,
+            rejectionPositions: rejectionPositions,
+            contextLength: contextLength
         )
         
         // Higher rejection count = higher priority (more valuable for learning)
@@ -144,8 +152,10 @@ public actor TrainingBuffer {
         case 2...3: priority = .normal
         default: priority = .high
         }
+
+        let longTail = (contextLength ?? 0) >= 512 || rejectedCount >= 3
         
-        push(sample: sample, priority: priority, rejectionCount: rejectedCount)
+        push(sample: sample, priority: priority, rejectionCount: rejectedCount, isLongTail: longTail)
     }
     
 
@@ -230,6 +240,16 @@ public actor TrainingBuffer {
     /// Check if buffer is full
     public func isFull() -> Bool {
         buffer.count >= capacity
+    }
+    
+    /// Check if there is any long-tail sample
+    public func hasLongTailSample() -> Bool {
+        buffer.contains { $0.isLongTail }
+    }
+    
+    /// Check if there is any high-priority sample (e.g., long-tail rejections)
+    public func hasHighPrioritySample() -> Bool {
+        buffer.contains { $0.priority == .high }
     }
     
 

@@ -279,8 +279,8 @@ public struct ModelConfiguration: Sendable {
         switch tier {
         case .entry:
             return ModelConfiguration(
-                targetModelId: "mlx-community/Qwen2.5-3B-Instruct-4bit",
-                drafterModelId: "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+                targetModelId: "mlx-community/Qwen3-4B-Instruct-4bit",
+                drafterModelId: "mlx-community/Qwen3-0.6B-Instruct-4bit",
                 targetQuantization: .int4,
                 drafterQuantization: .int4,
                 maxContextLength: 4096,
@@ -288,8 +288,8 @@ public struct ModelConfiguration: Sendable {
             )
         case .pro:
             return ModelConfiguration(
-                targetModelId: "mlx-community/Qwen2.5-7B-Instruct-4bit",
-                drafterModelId: "mlx-community/Qwen2.5-0.5B-Instruct",
+                targetModelId: "mlx-community/Qwen3-7B-Instruct-4bit",
+                drafterModelId: "mlx-community/Qwen3-0.6B-Instruct",
                 targetQuantization: .int4,
                 drafterQuantization: .fp16,
                 maxContextLength: 8192,
@@ -297,8 +297,8 @@ public struct ModelConfiguration: Sendable {
             )
         case .elite:
             return ModelConfiguration(
-                targetModelId: "mlx-community/Qwen2.5-32B-Instruct-4bit",
-                drafterModelId: "mlx-community/Qwen2.5-0.5B-Instruct",
+                targetModelId: "mlx-community/Qwen3-32B-Instruct-4bit",
+                drafterModelId: "mlx-community/Qwen3-0.6B-Instruct",
                 targetQuantization: .int4,
                 drafterQuantization: .fp16,
                 maxContextLength: 16384,

@@ -14,8 +14,8 @@ public struct TokenizerConfig: Sendable {
     public let bosTokenId: Int32?
     public let chatTemplate: String?
     
-    public static let qwen2_5 = TokenizerConfig(
-        modelId: "Qwen/Qwen2.5-0.5B-Instruct",
+    public static let qwen3 = TokenizerConfig(
+        modelId: "Qwen/Qwen3-0.6B-Instruct",
         padTokenId: 151643,
         eosTokenId: 151645,
         bosTokenId: nil,
@@ -36,14 +36,6 @@ public struct TokenizerConfig: Sendable {
         <|im_start|>assistant
         {%- endif %}
         """
-    )
-    
-    public static let qwen3 = TokenizerConfig(
-        modelId: "Qwen/Qwen3-0.6B",
-        padTokenId: 151643,
-        eosTokenId: 151645,
-        bosTokenId: nil,
-        chatTemplate: nil
     )
 }
 
@@ -79,7 +71,7 @@ public actor TokenizerManager {
     // Cache for common tokens
     private var specialTokenCache: [String: Int32] = [:]
     
-    public init(config: TokenizerConfig = .qwen2_5) {
+    public init(config: TokenizerConfig = .qwen3) {
         self.config = config
     }
     
@@ -178,7 +170,7 @@ public actor TokenizerManager {
     
     /// Get vocabulary size (uses config default since tokenizer doesn't expose this)
     public func vocabSize() -> Int {
-        // Qwen2.5 vocabulary size
+        // Qwen3 vocabulary size
         151936
     }
     

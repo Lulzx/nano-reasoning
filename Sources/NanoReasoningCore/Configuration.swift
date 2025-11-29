@@ -215,42 +215,42 @@ public struct ModelRegistry {
     public static let targetModels: [ModelInfo] = [
         // Entry tier (16GB)
         ModelInfo(
-            id: "mlx-community/Qwen2.5-3B-Instruct-4bit",
-            name: "Qwen2.5 3B",
-            size: "3B",
+            id: "mlx-community/Qwen3-4B-Instruct-4bit",
+            name: "Qwen3 4B",
+            size: "4B",
             quantization: "4-bit",
-            memoryRequired: 2.5,
+            memoryRequired: 3.0,
             tier: .entry
         ),
         // Pro tier (24GB+)
         ModelInfo(
-            id: "mlx-community/Qwen2.5-7B-Instruct-4bit",
-            name: "Qwen2.5 7B",
+            id: "mlx-community/Qwen3-7B-Instruct-4bit",
+            name: "Qwen3 7B",
             size: "7B",
             quantization: "4-bit",
-            memoryRequired: 5.0,
+            memoryRequired: 5.5,
             tier: .pro
         ),
         ModelInfo(
-            id: "mlx-community/Qwen2.5-14B-Instruct-4bit",
-            name: "Qwen2.5 14B",
+            id: "mlx-community/Qwen3-14B-Instruct-4bit",
+            name: "Qwen3 14B",
             size: "14B",
             quantization: "4-bit",
-            memoryRequired: 9.0,
+            memoryRequired: 9.5,
             tier: .pro
         ),
         // Elite tier (36GB+)
         ModelInfo(
-            id: "mlx-community/Qwen2.5-32B-Instruct-4bit",
-            name: "Qwen2.5 32B",
+            id: "mlx-community/Qwen3-32B-Instruct-4bit",
+            name: "Qwen3 32B",
             size: "32B",
             quantization: "4-bit",
-            memoryRequired: 20.0,
+            memoryRequired: 21.0,
             tier: .elite
         ),
         ModelInfo(
-            id: "mlx-community/Qwen2.5-72B-Instruct-4bit",
-            name: "Qwen2.5 72B",
+            id: "mlx-community/Qwen3-72B-Instruct-4bit",
+            name: "Qwen3 72B",
             size: "72B",
             quantization: "4-bit",
             memoryRequired: 45.0,
@@ -261,27 +261,27 @@ public struct ModelRegistry {
     /// All known drafter models
     public static let drafterModels: [ModelInfo] = [
         ModelInfo(
-            id: "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-            name: "Qwen2.5 0.5B (4-bit)",
-            size: "0.5B",
+            id: "mlx-community/Qwen3-0.6B-Instruct-4bit",
+            name: "Qwen3 0.6B (4-bit)",
+            size: "0.6B",
             quantization: "4-bit",
-            memoryRequired: 0.5,
+            memoryRequired: 0.6,
             tier: .entry
         ),
         ModelInfo(
-            id: "mlx-community/Qwen2.5-0.5B-Instruct",
-            name: "Qwen2.5 0.5B (FP16)",
-            size: "0.5B",
+            id: "mlx-community/Qwen3-0.6B-Instruct",
+            name: "Qwen3 0.6B (FP16)",
+            size: "0.6B",
             quantization: "fp16",
-            memoryRequired: 1.0,
+            memoryRequired: 1.2,
             tier: .pro
         ),
         ModelInfo(
-            id: "mlx-community/Qwen2.5-1.5B-Instruct",
-            name: "Qwen2.5 1.5B (FP16)",
-            size: "1.5B",
+            id: "mlx-community/Qwen3-1.8B-Instruct",
+            name: "Qwen3 1.8B (FP16)",
+            size: "1.8B",
             quantization: "fp16",
-            memoryRequired: 3.0,
+            memoryRequired: 3.5,
             tier: .elite
         ),
     ]
@@ -352,6 +352,14 @@ public struct EnvironmentConfig {
     /// Get log level from environment
     public static var logLevel: String {
         ProcessInfo.processInfo.environment["NANO_REASONING_LOG_LEVEL"] ?? "info"
+    }
+    
+    /// Optional override for pre-downloaded model weights (safetensors directory or file)
+    public static var modelWeightsPath: URL? {
+        guard let envPath = ProcessInfo.processInfo.environment["NANO_REASONING_WEIGHTS"] else {
+            return nil
+        }
+        return URL(fileURLWithPath: envPath)
     }
 }
 

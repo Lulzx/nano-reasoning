@@ -38,9 +38,9 @@ Nano-Reasoning implements an adaptive speculative decoding pipeline where a smal
 
 | Tier | Chips | RAM | Target Model | Drafter | Strategy |
 |------|-------|-----|--------------|---------|----------|
-| Entry | M1/M2 | 16GB | Qwen2.5-3B (4-bit) | Qwen2.5-0.5B (4-bit) | Frozen Speculator |
-| Pro | M1/M2/M3 Pro/Max | 24GB+ | Qwen2.5-7B (4-bit) | Qwen2.5-0.5B (FP16) | Adaptive LoRA |
-| Elite | M4/M5 | 36GB+ | Qwen2.5-32B (4-bit) | Qwen2.5-0.5B (FP16) | Full EAGLE + NPU |
+| Entry | M1/M2 | 16GB | Qwen3-4B (4-bit) | Qwen3-0.6B (4-bit) | Frozen Speculator |
+| Pro | M1/M2/M3 Pro/Max | 24GB+ | Qwen3-7B (4-bit) | Qwen3-0.6B (FP16) | Adaptive LoRA |
+| Elite | M4/M5 | 36GB+ | Qwen3-32B (4-bit) | Qwen3-0.6B (FP16) | Full EAGLE + NPU |
 
 ## Requirements
 
@@ -258,8 +258,8 @@ if orchestrator.isFastRLMode() {
     "enableNPUOffload": true
   },
   "models": {
-    "targetModelId": "mlx-community/Qwen2.5-7B-Instruct-4bit",
-    "drafterModelId": "mlx-community/Qwen2.5-0.5B-Instruct"
+    "targetModelId": "mlx-community/Qwen3-7B-Instruct-4bit",
+    "drafterModelId": "mlx-community/Qwen3-0.6B-Instruct"
   },
   "generation": {
     "maxTokens": 2048,
@@ -288,8 +288,8 @@ if orchestrator.isFastRLMode() {
 ### Benchmark Results (M4 Pro, 24GB)
 
 ```
-Model: Qwen2.5-7B-Instruct-4bit
-Drafter: Qwen2.5-0.5B-Instruct
+Model: Qwen3-7B-Instruct-4bit
+Drafter: Qwen3-0.6B-Instruct
 
 Standard Generation:  45.2 tokens/sec
 Speculative (cold):   62.8 tokens/sec (1.39x)

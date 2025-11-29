@@ -18,17 +18,25 @@ public struct TrainingSample: @unchecked Sendable {
     public let inputIds: MLXArray
     /// Attention mask
     public let attentionMask: MLXArray?
+    /// Optional positions where drafts were rejected (for focused training)
+    public let rejectionPositions: [Int]
+    /// Context length at time of collection (for long-tail detection)
+    public let contextLength: Int?
     
     public init(
         hiddenStates: MLXArray,
         targetLogits: MLXArray,
         inputIds: MLXArray,
-        attentionMask: MLXArray? = nil
+        attentionMask: MLXArray? = nil,
+        rejectionPositions: [Int] = [],
+        contextLength: Int? = nil
     ) {
         self.hiddenStates = hiddenStates
         self.targetLogits = targetLogits
         self.inputIds = inputIds
         self.attentionMask = attentionMask
+        self.rejectionPositions = rejectionPositions
+        self.contextLength = contextLength
     }
 }
 
@@ -213,20 +221,20 @@ public struct SingleLayerDrafterConfig: Sendable {
     public let vocabSize: Int        // Must match target model's vocab size
     public let intermediateSize: Int // MLP intermediate dimension
     
-    /// Default config for Qwen2.5 models
-    public static func forQwen2_5(size: String) -> SingleLayerDrafterConfig {
+    /// Default config for Qwen3 models
+    public static func forQwen3(size: String) -> SingleLayerDrafterConfig {
         switch size {
         case "7B":
-            return SingleLayerDrafterConfig(hiddenSize: 3584, vocabSize: 152064, intermediateSize: 4096)
+            return SingleLayerDrafterConfig(hiddenSize: 4096, vocabSize: 152064, intermediateSize: 4608)
         case "32B":
             return SingleLayerDrafterConfig(hiddenSize: 5120, vocabSize: 152064, intermediateSize: 6144)
-        case "3B", "4B":
-            return SingleLayerDrafterConfig(hiddenSize: 2560, vocabSize: 152064, intermediateSize: 3072)
-        case "0.5B", "0.6B":
+        case "4B":
+            return SingleLayerDrafterConfig(hiddenSize: 3072, vocabSize: 152064, intermediateSize: 3584)
+        case "0.6B":
             return SingleLayerDrafterConfig(hiddenSize: 1024, vocabSize: 151936, intermediateSize: 1536)
         default:
             // Default to 7B config
-            return SingleLayerDrafterConfig(hiddenSize: 3584, vocabSize: 152064, intermediateSize: 4096)
+            return SingleLayerDrafterConfig(hiddenSize: 4096, vocabSize: 152064, intermediateSize: 4608)
         }
     }
     
@@ -482,9 +490,62 @@ public actor FastRLDrafterActor {
         return tokens
     }
     
+    /// Generate drafts with log probabilities for lossless verification
+    public func generateDraftsWithLogProbs(
+        hiddenState: MLXArray,
+        prevToken: MLXArray,
+        count: Int,
+        temperature: Float = 1.0,
+        topK: Int = 8
+    ) -> (tokens: [Int32], logProbs: [Float]) {
+        var draftTokens: [Int32] = []
+        var logProbs: [Float] = []
+        var currentHidden = hiddenState
+        var currentToken = prevToken
+        
+        for _ in 0..<count {
+            let logits = drafter(hiddenState: currentHidden, prevTokenId: currentToken).squeezed()
+            let scaled = temperature > 0 ? logits / temperature : logits
+            let probs = softmax(scaled)
+            let nextToken = sampleToken(logits: logits, temperature: temperature, topK: topK)
+            draftTokens.append(nextToken)
+            let prob = probs[Int(nextToken)].item(Float.self)
+            logProbs.append(log(max(prob, 1e-8)))
+            
+            let nextTokenArray = MLXArray([nextToken])
+            // Update hidden by a forward pass on the predicted token embedding
+            currentHidden = drafter(hiddenState: currentHidden, prevTokenId: nextTokenArray)
+            currentToken = nextTokenArray
+        }
+        
+        totalDrafts += count
+        return (draftTokens, logProbs)
+    }
+    
     /// Get logits for a single position
     public func getLogits(hiddenState: MLXArray, prevToken: MLXArray) -> MLXArray {
         drafter(hiddenState: hiddenState, prevTokenId: prevToken)
+    }
+    
+    private func sampleToken(logits: MLXArray, temperature: Float, topK: Int) -> Int32 {
+        var processed = logits
+        if topK > 0 && topK < logits.shape[0] {
+            let sorted = MLX.sorted(processed)
+            let threshold = sorted[sorted.shape[0] - topK]
+            let mask = processed .< threshold
+            processed = MLX.where(mask, MLXArray(-Float.infinity), processed)
+        }
+        return sampleToken(logits: processed, temperature: temperature)
+    }
+    
+    private func sampleToken(logits: MLXArray, temperature: Float) -> Int32 {
+        if temperature <= 0 {
+            return Int32(MLX.argMax(logits).item(Int32.self))
+        }
+        let scaled = logits / temperature
+        let probs = MLX.softmax(scaled)
+        let sample = MLXRandom.categorical(probs.expandedDimensions(axis: 0))
+        return sample.item(Int32.self)
     }
     
     /// Collect training data from target model inference
@@ -748,6 +809,43 @@ public actor DrafterActor {
         
         totalDrafts += k
         return draftTokens
+    }
+    
+    /// Generate drafts with log probabilities for lossless verification
+    public func generateDraftWithLogProbs(
+        hiddenStates: MLXArray,
+        previousTokens: MLXArray,
+        count k: Int = 5,
+        temperature: Float = 0.7
+    ) -> (tokens: [Int32], logProbs: [Float]) {
+        var draftTokens: [Int32] = []
+        var logProbs: [Float] = []
+        var currentHidden = hiddenStates
+        var currentTokens = previousTokens
+        
+        for _ in 0..<k {
+            let embeddings = model.getEmbeddings(currentTokens)
+            let lastEmbedding = embeddings[embeddings.shape[0] - 1]
+            let lastHidden = currentHidden[currentHidden.shape[0] - 1]
+            let logits = model(lastHidden.expandedDimensions(axis: 0), previousEmbeddings: lastEmbedding.expandedDimensions(axis: 0)).squeezed()
+            
+            // Temperature scaling
+            let scaled = temperature > 0 ? logits / temperature : logits
+            let probs = softmax(scaled)
+            let nextToken = sampleToken(logits: logits, temperature: temperature)
+            draftTokens.append(nextToken)
+            
+            let tokenProb = probs[Int(nextToken)].item(Float.self)
+            logProbs.append(log(max(tokenProb, 1e-8)))
+            
+            let nextTokenArray = MLXArray([nextToken])
+            let nextEmbedding = model.getEmbeddings(nextTokenArray)
+            currentHidden = MLX.concatenated([currentHidden, nextEmbedding], axis: 0)
+            currentTokens = MLX.concatenated([currentTokens, nextTokenArray], axis: 0)
+        }
+        
+        totalDrafts += k
+        return (draftTokens, logProbs)
     }
     
     /// Sample a token from logits
@@ -1366,5 +1464,3 @@ public actor DrafterEnsemble {
         drafters.count
     }
 }
-
-

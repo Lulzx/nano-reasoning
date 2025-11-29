@@ -211,8 +211,10 @@ public actor TrainerTask {
             
             // Check GPU load - yield to inference if under load
             let isUnderLoad = await loadMonitor.checkUnderLoad()
-            if isUnderLoad {
-                // M1/M2 optimization: back off when GPU is saturated
+            let hasHighPriority = await buffer.hasHighPrioritySample()
+            let hasLongTail = await buffer.hasLongTailSample()
+            if isUnderLoad && !hasHighPriority && !hasLongTail {
+                // M1/M2 optimization: back off when GPU is saturated unless we have high-priority or long-tail samples
                 try? await Task.sleep(for: .milliseconds(200))
                 continue
             }
@@ -301,6 +303,7 @@ public actor TrainerTask {
                 step: currentStep,
                 loss: getAverageLoss(),
                 acceptanceRate: await drafter.getAcceptanceRate(),
+                acceptanceLength: 0,
                 timestamp: Date(),
                 tier: tier
             )
@@ -323,6 +326,7 @@ public struct CheckpointMetadata: Codable, Sendable {
     public let step: Int
     public let loss: Float
     public let acceptanceRate: Float
+    public let acceptanceLength: Float
     public let timestamp: Date
     public let tier: String
     
@@ -330,12 +334,14 @@ public struct CheckpointMetadata: Codable, Sendable {
         step: Int,
         loss: Float,
         acceptanceRate: Float,
+        acceptanceLength: Float,
         timestamp: Date,
         tier: HardwareTier
     ) {
         self.step = step
         self.loss = loss
         self.acceptanceRate = acceptanceRate
+        self.acceptanceLength = acceptanceLength
         self.timestamp = timestamp
         self.tier = tier.description
     }
