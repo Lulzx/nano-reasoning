@@ -306,17 +306,22 @@ public actor TrainingBuffer {
 
 extension TrainingBuffer {
     /// Create an async stream of training batches
-    public func batchStream(batchSize: Int, pollInterval: Duration = .milliseconds(100)) -> AsyncStream<[TrainingSample]> {
-        AsyncStream { continuation in
-            Task {
+    /// Uses nonisolated(unsafe) to avoid unnecessary actor isolation in stream
+    public nonisolated func batchStream(batchSize: Int, pollInterval: Duration = .milliseconds(100)) -> AsyncStream<[TrainingSample]> {
+        let buffer = self
+        return AsyncStream { continuation in
+            let task = Task {
                 while !Task.isCancelled {
-                    let batch = await self.popBatch(maxSize: batchSize)
+                    let batch = await buffer.popBatch(maxSize: batchSize)
                     if !batch.isEmpty {
                         continuation.yield(batch)
                     }
                     try? await Task.sleep(for: pollInterval)
                 }
                 continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
             }
         }
     }

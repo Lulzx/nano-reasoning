@@ -4,6 +4,7 @@
 
 import Foundation
 @preconcurrency import MLX
+import Tokenizers
 
 /// Generation statistics
 public struct GenerationStatistics: Sendable {
@@ -55,6 +56,12 @@ public actor Orchestrator {
     private var trainingBuffer: TrainingBuffer?
     private var trainerTask: TrainerTask?
     private var loadMonitor: GPULoadMonitor
+    private var tokenizerManager: TokenizerManager?
+    
+    // FastRL components (lightweight single-layer drafter)
+    private var fastRLDrafter: FastRLDrafterActor?
+    private var fastRLDecoder: FastRLSpeculativeDecoder?
+    private var useFastRLMode: Bool = false
     
     // Configuration
     private let hardwareProfile: HardwareProfile
@@ -147,6 +154,11 @@ public actor Orchestrator {
                 )
             }
             
+            // Initialize tokenizer
+            progressHandler?("Loading tokenizer...", 0.9)
+            tokenizerManager = TokenizerManager(config: .qwen2_5)
+            try await tokenizerManager?.load()
+            
             progressHandler?("Ready!", 1.0)
             state = .ready
             
@@ -158,12 +170,122 @@ public actor Orchestrator {
     
     /// Start background training (if available)
     public func startTraining() async {
-        await trainerTask?.start()
+        if useFastRLMode {
+            await fastRLDecoder?.startBackgroundTraining()
+        } else {
+            await trainerTask?.start()
+        }
     }
     
     /// Stop background training
     public func stopTraining() async {
-        await trainerTask?.stop()
+        if useFastRLMode {
+            await fastRLDecoder?.stopBackgroundTraining()
+        } else {
+            await trainerTask?.stop()
+        }
+    }
+    
+    /// Initialize with FastRL-style lightweight drafter
+    /// This uses a single-layer EAGLE head instead of a full drafter model
+    public func initializeFastRL(progressHandler: ((String, Double) -> Void)? = nil) async throws {
+        guard case .uninitialized = state else {
+            if case .ready = state { return }
+            throw OrchestratorError.invalidState("Cannot initialize from current state")
+        }
+        
+        state = .loading
+        useFastRLMode = true
+        
+        do {
+            // Initialize target model
+            progressHandler?("Loading target model...", 0.0)
+            targetModel = TargetModel(configuration: modelConfig, tier: hardwareProfile.tier)
+            try await targetModel?.loadModel(progressHandler: nil)
+            progressHandler?("Loading target model...", 0.5)
+            
+            // Initialize FastRL lightweight drafter (single-layer EAGLE head)
+            progressHandler?("Initializing FastRL drafter...", 0.6)
+            let drafterConfig = SingleLayerDrafterConfig.forQwen2_5(size: getTargetModelSize())
+            fastRLDrafter = FastRLDrafterActor(
+                config: drafterConfig,
+                learningRate: 1e-4,
+                loadMonitor: loadMonitor
+            )
+            
+            // Initialize FastRL speculative decoder
+            progressHandler?("Setting up FastRL decoder...", 0.7)
+            fastRLDecoder = FastRLSpeculativeDecoder(
+                drafter: fastRLDrafter!,
+                target: targetModel!,
+                loadMonitor: loadMonitor
+            )
+            
+            // Initialize tokenizer
+            progressHandler?("Loading tokenizer...", 0.9)
+            tokenizerManager = TokenizerManager(config: .qwen2_5)
+            try await tokenizerManager?.load()
+            
+            progressHandler?("Ready (FastRL mode)!", 1.0)
+            state = .ready
+            
+        } catch {
+            state = .error(error.localizedDescription)
+            throw error
+        }
+    }
+    
+    /// Get target model size string for config selection
+    private func getTargetModelSize() -> String {
+        switch hardwareProfile.tier {
+        case .entry:
+            return "3B"
+        case .pro:
+            return "7B"
+        case .elite:
+            return "32B"
+        }
+    }
+    
+    /// Check if running in FastRL mode
+    public func isFastRLMode() -> Bool {
+        useFastRLMode
+    }
+    
+    /// Load drafter weights from the latest checkpoint
+    public func loadLatestCheckpoint() async throws -> CheckpointMetadata? {
+        guard let drafter = drafterActor else {
+            throw OrchestratorError.componentNotInitialized
+        }
+        
+        let manager = CheckpointManager.shared
+        return try await manager.loadLatestCheckpoint(into: drafter)
+    }
+    
+    /// Save current drafter state as checkpoint
+    public func saveCheckpoint() async throws {
+        guard let drafter = drafterActor else {
+            throw OrchestratorError.componentNotInitialized
+        }
+        
+        let stats = await getTrainingStatistics()
+        let metadata = CheckpointMetadata(
+            step: stats?.step ?? 0,
+            loss: stats?.loss ?? 0,
+            acceptanceRate: stats?.acceptanceRate ?? 0,
+            timestamp: Date(),
+            tier: hardwareProfile.tier
+        )
+        
+        try await CheckpointManager.shared.saveCheckpoint(
+            drafter: drafter,
+            metadata: metadata
+        )
+    }
+    
+    /// List available checkpoints
+    public func listCheckpoints() async throws -> [(url: URL, metadata: CheckpointMetadata)] {
+        try await CheckpointManager.shared.listCheckpoints()
     }
     
 
@@ -357,19 +479,33 @@ public actor Orchestrator {
     
 
     // Tokenization
-    // For production, integrate with HuggingFace Tokenizers via swift-transformers
+    // Uses HuggingFace Tokenizers via swift-transformers
     
     private func tokenize(_ text: String) async throws -> [Int32] {
-        // UTF-8 byte encoding as fallback tokenization
-        // Production: Use AutoTokenizer.from(pretrained: modelConfig.targetModelId)
-        return text.utf8.map { Int32($0) }
+        guard let tokenizer = tokenizerManager else {
+            throw OrchestratorError.tokenizationFailed("Tokenizer not initialized")
+        }
+        return try await tokenizer.encode(text)
     }
     
     private func detokenize(_ tokens: [Int32]) async throws -> String {
-        // UTF-8 byte decoding as fallback detokenization
-        // Production: Use tokenizer.decode(tokens)
-        let bytes = tokens.compactMap { UInt8(exactly: $0) }
-        return String(bytes: bytes, encoding: .utf8) ?? ""
+        guard let tokenizer = tokenizerManager else {
+            throw OrchestratorError.tokenizationFailed("Tokenizer not initialized")
+        }
+        return try await tokenizer.decode(tokens)
+    }
+    
+    /// Tokenize a chat conversation
+    public func tokenizeChat(messages: [ChatMessage], addGenerationPrompt: Bool = true) async throws -> [Int32] {
+        guard let tokenizer = tokenizerManager else {
+            throw OrchestratorError.tokenizationFailed("Tokenizer not initialized")
+        }
+        return try await tokenizer.encodeChat(messages: messages, addGenerationPrompt: addGenerationPrompt)
+    }
+    
+    /// Get the tokenizer manager for direct access
+    public func getTokenizer() -> TokenizerManager? {
+        tokenizerManager
     }
     
 

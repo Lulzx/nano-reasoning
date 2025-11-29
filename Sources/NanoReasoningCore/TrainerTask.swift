@@ -294,8 +294,222 @@ public actor TrainerTask {
     }
     
     private func saveCheckpoint() async {
-        // Implement checkpoint saving
-        // Would save drafter weights to disk
+        let checkpointManager = CheckpointManager.shared
+        
+        do {
+            let metadata = CheckpointMetadata(
+                step: currentStep,
+                loss: getAverageLoss(),
+                acceptanceRate: await drafter.getAcceptanceRate(),
+                timestamp: Date(),
+                tier: tier
+            )
+            
+            try await checkpointManager.saveCheckpoint(
+                drafter: drafter,
+                metadata: metadata
+            )
+        } catch {
+            // Log error but don't fail training
+            print("Warning: Failed to save checkpoint at step \(currentStep): \(error)")
+        }
+    }
+}
+
+// Checkpoint Management
+
+/// Metadata stored with each checkpoint
+public struct CheckpointMetadata: Codable, Sendable {
+    public let step: Int
+    public let loss: Float
+    public let acceptanceRate: Float
+    public let timestamp: Date
+    public let tier: String
+    
+    public init(
+        step: Int,
+        loss: Float,
+        acceptanceRate: Float,
+        timestamp: Date,
+        tier: HardwareTier
+    ) {
+        self.step = step
+        self.loss = loss
+        self.acceptanceRate = acceptanceRate
+        self.timestamp = timestamp
+        self.tier = tier.description
+    }
+}
+
+/// Manages checkpoint saving and loading
+public actor CheckpointManager {
+    public static let shared = CheckpointManager()
+    
+    private let fileManager = FileManager.default
+    private var checkpointDirectory: URL
+    private let maxCheckpoints: Int
+    
+    public init(maxCheckpoints: Int = 5) {
+        self.maxCheckpoints = maxCheckpoints
+        
+        // Default checkpoint directory
+        let cacheDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        self.checkpointDirectory = cacheDir
+            .appendingPathComponent("nano-reasoning")
+            .appendingPathComponent("checkpoints")
+    }
+    
+    /// Set custom checkpoint directory
+    public func setCheckpointDirectory(_ url: URL) {
+        checkpointDirectory = url
+    }
+    
+    /// Get checkpoint directory
+    public func getCheckpointDirectory() -> URL {
+        checkpointDirectory
+    }
+    
+    /// Save a checkpoint
+    public func saveCheckpoint(
+        drafter: DrafterActor,
+        metadata: CheckpointMetadata
+    ) async throws {
+        // Ensure directory exists
+        try fileManager.createDirectory(at: checkpointDirectory, withIntermediateDirectories: true)
+        
+        // Create checkpoint name with timestamp
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate, .withTime, .withColonSeparatorInTime]
+        let timestamp = formatter.string(from: metadata.timestamp)
+            .replacingOccurrences(of: ":", with: "-")
+        
+        let checkpointName = "checkpoint-\(metadata.step)-\(timestamp)"
+        let checkpointDir = checkpointDirectory.appendingPathComponent(checkpointName)
+        try fileManager.createDirectory(at: checkpointDir, withIntermediateDirectories: true)
+        
+        // Save weights
+        let weightsURL = checkpointDir.appendingPathComponent("weights.safetensors")
+        try await drafter.saveWeights(to: weightsURL)
+        
+        // Save LoRA weights separately if available
+        let loraURL = checkpointDir.appendingPathComponent("lora.safetensors")
+        try await drafter.saveLoRAWeights(to: loraURL)
+        
+        // Save metadata
+        let metadataURL = checkpointDir.appendingPathComponent("metadata.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let metadataData = try encoder.encode(metadata)
+        try metadataData.write(to: metadataURL)
+        
+        // Cleanup old checkpoints
+        try cleanupOldCheckpoints()
+    }
+    
+    /// Load the latest checkpoint
+    public func loadLatestCheckpoint(into drafter: DrafterActor) async throws -> CheckpointMetadata? {
+        guard let latest = try getLatestCheckpoint() else {
+            return nil
+        }
+        
+        return try await loadCheckpoint(from: latest, into: drafter)
+    }
+    
+    /// Load a specific checkpoint
+    public func loadCheckpoint(
+        from checkpointDir: URL,
+        into drafter: DrafterActor
+    ) async throws -> CheckpointMetadata {
+        // Load metadata
+        let metadataURL = checkpointDir.appendingPathComponent("metadata.json")
+        let metadataData = try Data(contentsOf: metadataURL)
+        let metadata = try JSONDecoder().decode(CheckpointMetadata.self, from: metadataData)
+        
+        // Load weights
+        let weightsURL = checkpointDir.appendingPathComponent("weights.safetensors")
+        if fileManager.fileExists(atPath: weightsURL.path) {
+            try await drafter.loadWeights(from: weightsURL)
+        }
+        
+        // Load LoRA weights if available
+        let loraURL = checkpointDir.appendingPathComponent("lora.safetensors")
+        if fileManager.fileExists(atPath: loraURL.path) {
+            try await drafter.loadLoRAWeights(from: loraURL)
+        }
+        
+        return metadata
+    }
+    
+    /// Get all available checkpoints sorted by step (newest first)
+    public func listCheckpoints() throws -> [(url: URL, metadata: CheckpointMetadata)] {
+        guard fileManager.fileExists(atPath: checkpointDirectory.path) else {
+            return []
+        }
+        
+        let contents = try fileManager.contentsOfDirectory(
+            at: checkpointDirectory,
+            includingPropertiesForKeys: nil
+        )
+        
+        var checkpoints: [(url: URL, metadata: CheckpointMetadata)] = []
+        
+        for dir in contents where dir.hasDirectoryPath {
+            let metadataURL = dir.appendingPathComponent("metadata.json")
+            guard fileManager.fileExists(atPath: metadataURL.path) else { continue }
+            
+            do {
+                let data = try Data(contentsOf: metadataURL)
+                let metadata = try JSONDecoder().decode(CheckpointMetadata.self, from: data)
+                checkpoints.append((dir, metadata))
+            } catch {
+                continue
+            }
+        }
+        
+        return checkpoints.sorted { $0.metadata.step > $1.metadata.step }
+    }
+    
+    /// Get the latest checkpoint
+    public func getLatestCheckpoint() throws -> URL? {
+        try listCheckpoints().first?.url
+    }
+    
+    /// Delete a checkpoint
+    public func deleteCheckpoint(at url: URL) throws {
+        try fileManager.removeItem(at: url)
+    }
+    
+    /// Cleanup old checkpoints, keeping only the most recent ones
+    private func cleanupOldCheckpoints() throws {
+        let checkpoints = try listCheckpoints()
+        
+        if checkpoints.count > maxCheckpoints {
+            let toDelete = checkpoints.dropFirst(maxCheckpoints)
+            for checkpoint in toDelete {
+                try? fileManager.removeItem(at: checkpoint.url)
+            }
+        }
+    }
+    
+    /// Get total size of all checkpoints
+    public func getTotalCheckpointSize() throws -> Int64 {
+        guard fileManager.fileExists(atPath: checkpointDirectory.path) else {
+            return 0
+        }
+        
+        var totalSize: Int64 = 0
+        
+        if let enumerator = fileManager.enumerator(
+            at: checkpointDirectory,
+            includingPropertiesForKeys: [.fileSizeKey]
+        ) {
+            for case let fileURL as URL in enumerator {
+                let attributes = try fileURL.resourceValues(forKeys: [.fileSizeKey])
+                totalSize += Int64(attributes.fileSize ?? 0)
+            }
+        }
+        
+        return totalSize
     }
 }
 

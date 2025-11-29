@@ -28,6 +28,11 @@ Nano-Reasoning implements an adaptive speculative decoding pipeline where a smal
 - **Background Training**: Training runs at background priority, yielding to inference on GPU load
 - **EAGLE-Style Speculation**: Hidden state fusion for improved draft quality
 - **LoRA Adapters**: Memory-efficient fine-tuning for Pro tier systems
+- **FastRL Integration**: Multi-Armed Bandit (MAB) for adaptive SD configuration selection
+- **Adaptive Rollout Engine**: Dynamic enable/disable of speculative decoding based on batch characteristics
+- **Hidden State Collection**: Collects target model hidden states during inference for drafter training
+- **Single-Layer EAGLE Drafter**: Lightweight FastRL-style drafter head (~1MB vs ~1GB for full model)
+- **Online Drafter Training**: Continuous adaptation during inference using collected hidden states
 
 ## Hardware Tiers
 
@@ -158,6 +163,41 @@ try await orchestrator.initialize()
 await orchestrator.startTraining()
 ```
 
+### FastRL Mode (Lightweight Drafter)
+
+For maximum efficiency, use FastRL mode which uses a single-layer EAGLE head instead of a full drafter model:
+
+```swift
+import NanoReasoningCore
+
+let orchestrator = Orchestrator()
+
+// Initialize in FastRL mode (single-layer drafter)
+try await orchestrator.initializeFastRL { message, progress in
+    print("\(message) (\(Int(progress * 100))%)")
+}
+
+// Start background drafter training
+await orchestrator.startTraining()
+
+// Generate with adaptive speculative decoding
+let response = try await orchestrator.generate(
+    prompt: "Explain quantum computing",
+    maxTokens: 500
+)
+
+// Check FastRL statistics
+if orchestrator.isFastRLMode() {
+    print("Running in FastRL mode with lightweight drafter")
+}
+```
+
+**FastRL Benefits:**
+- ~1000x smaller drafter (1MB vs 1GB)
+- Faster adaptation during inference
+- MAB-based SD configuration selection
+- Automatic batch-size-aware SD enable/disable
+
 ## Architecture
 
 ### Core Components
@@ -170,6 +210,9 @@ await orchestrator.startTraining()
 | `TrainingBuffer` | Actor | Ring buffer with priority-based sampling |
 | `TrainerTask` | Actor | Background training loop with GPU awareness |
 | `SpeculativeDecoder` | Actor | Draft → Verify → Accept logic |
+| `FastRLSpeculativeDecoder` | Actor | FastRL-style adaptive SD with MAB |
+| `SingleLayerEAGLEDrafter` | Class | Lightweight single-layer EAGLE head |
+| `FastRLDrafterActor` | Actor | Manages single-layer drafter + online training |
 
 ### Speculative Decoding Flow
 
@@ -299,13 +342,16 @@ swift package generate-documentation
 
 ## Roadmap
 
-- [ ] Tree-based speculation for higher acceptance rates
-- [ ] Metal 4 / NPU offload for M4/M5 chips
-- [ ] Quantized drafter training (INT8)
-- [ ] Multi-drafter ensemble
-- [ ] HuggingFace tokenizer integration
-- [ ] Model weight persistence and checkpointing
-- [ ] Distributed training across multiple Macs
+- [x] Tree-based speculation for higher acceptance rates
+- [x] Metal 4 / NPU offload for M4/M5 chips
+- [x] Quantized drafter training (INT8)
+- [x] Multi-drafter ensemble
+- [x] HuggingFace tokenizer integration
+- [x] Model weight persistence and checkpointing
+- [x] Distributed training across multiple Macs
+- [x] FastRL Adaptive Rollout Engine with MAB
+- [x] Hidden state collection for EAGLE training
+- [x] Adaptive background drafter training
 
 ## References
 

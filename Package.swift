@@ -24,6 +24,10 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.21.0"),
         // ArgumentParser for CLI
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
+        // HuggingFace Tokenizers for proper tokenization
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.14"),
+        // Network framework for distributed training
+        .package(url: "https://github.com/grpc/grpc-swift", from: "1.23.0"),
     ],
     targets: [
         .executableTarget(
@@ -41,6 +45,8 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "GRPC", package: "grpc-swift"),
             ]
         ),
         .testTarget(
